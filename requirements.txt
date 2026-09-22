@@ -1,1 +1,3 @@
 rich
+openai
+prompt_toolkit
