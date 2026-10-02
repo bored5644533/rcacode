@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -113,6 +114,18 @@ def _normalize_provider(value):
     return aliases.get(value, value)
 
 
+def _normalize_api_key(provider, value):
+    key = (value or "").strip().lstrip("\ufeff").strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {"'", '"'}:
+        key = key[1:-1].strip()
+    # OpenRouter keys are "sk-or-v<n>-<lowercase hex>" and are matched exactly,
+    # so a mistyped "Sk-or-v1-..." makes OpenRouter report a bogus
+    # "Missing Authentication header" 401 instead of "invalid key".
+    if provider == "openrouter" and re.fullmatch(r"(?i)sk-or-v\d+-[0-9a-f]+", key):
+        key = key.lower()
+    return key
+
+
 def _model_id(provider, model):
     safe_model = model.replace("/", "-").replace(":", "-").strip()
     return f"{provider}:{safe_model}"
@@ -155,10 +168,10 @@ def read_model_config():
     env_key = provider_data["env"]
     env_value = os.environ.get(env_key, "").strip()
     if env_value:
-        api_key = env_value
+        api_key = _normalize_api_key(provider, env_value)
         print(f"Using API key from {env_key}.")
     else:
-        api_key = input(f"API key for {provider_data['label']}: ").strip()
+        api_key = _normalize_api_key(provider, input(f"API key for {provider_data['label']}: ").strip())
 
     custom_id = input(f"Short name [{_model_id(provider, model)}]: ").strip()
     return ModelConfig(
@@ -207,7 +220,7 @@ def _legacy_to_config(raw):
         provider=provider,
         model=model,
         temperature=float(data.get("temperature", 0.2)),
-        api_key=(data.get("api_key") or os.environ.get(provider_data["env"], "")).strip(),
+        api_key=_normalize_api_key(provider, data.get("api_key") or os.environ.get(provider_data["env"], "")),
         base_url=data.get("base_url") or provider_data["base_url"],
     )
     return {"version": 1, "active_model": model_config.id, "models": [asdict(model_config)]}
@@ -227,7 +240,7 @@ def _normalize_config(config):
                 "provider": provider,
                 "model": model,
                 "temperature": float(item.get("temperature", 0.2)),
-                "api_key": (item.get("api_key") or os.environ.get(provider_data["env"], "")).strip(),
+                "api_key": _normalize_api_key(provider, item.get("api_key") or os.environ.get(provider_data["env"], "")),
                 "base_url": item.get("base_url") or provider_data["base_url"],
             }
         )
@@ -321,12 +334,47 @@ class OpenAICompatibleClient:
         self.client = OpenAI(**kwargs)
 
     def chat_completion(self, messages, functions):
-        return self.client.chat.completions.create(
-            model=self.settings.model,
-            messages=messages,
-            temperature=self.settings.temperature,
-            functions=functions,
-            function_call="auto",
+        tools = [{"type": "function", "function": function} for function in functions]
+        try:
+            response = self.client.chat.completions.create(
+                model=self.settings.model,
+                messages=messages,
+                temperature=self.settings.temperature,
+                tools=tools,
+                tool_choice="auto",
+            )
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            if status == 401:
+                env_key = PROVIDERS[self.settings.provider]["env"]
+                raise RuntimeError(
+                    f"{self.settings.label} rejected the API key stored in {PROVIDERINFO_PATH} "
+                    f"(model {self.settings.model}). Check the key or re-add this model with "
+                    f"/model add, or set {env_key}. Original error: {e}"
+                ) from e
+            raise
+        return self._as_function_call_response(response)
+
+    @staticmethod
+    def _as_function_call_response(response):
+        # The CLI reads message.function_call, but the modern API returns
+        # message.tool_calls. Bridge the two so callers stay unchanged.
+        choice = response.choices[0]
+        message = choice.message
+        if getattr(message, "function_call", None) is not None:
+            return response
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if not tool_calls:
+            return response
+
+        call = tool_calls[0].function
+        legacy_message = SimpleNamespace(
+            content=getattr(message, "content", ""),
+            function_call=SimpleNamespace(name=call.name, arguments=call.arguments),
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=legacy_message)],
+            usage=getattr(response, "usage", None),
         )
 
 
@@ -439,3 +487,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
