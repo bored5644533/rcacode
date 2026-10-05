@@ -8,8 +8,13 @@ from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
 
-PROVIDERINFO_PATH = "providerinfo.json"
-LEGACY_PROVIDERINFO_PATH = "providerinfo.txt"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+PROVIDERINFO_PATH = os.path.join(BASE_DIR, "providerinfo.json")
+LEGACY_PROVIDERINFO_PATH = os.path.join(BASE_DIR, "providerinfo.txt")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -118,9 +123,6 @@ def _normalize_api_key(provider, value):
     key = (value or "").strip().lstrip("\ufeff").strip()
     if len(key) >= 2 and key[0] == key[-1] and key[0] in {"'", '"'}:
         key = key[1:-1].strip()
-    # OpenRouter keys are "sk-or-v<n>-<lowercase hex>" and are matched exactly,
-    # so a mistyped "Sk-or-v1-..." makes OpenRouter report a bogus
-    # "Missing Authentication header" 401 instead of "invalid key".
     if provider == "openrouter" and re.fullmatch(r"(?i)sk-or-v\d+-[0-9a-f]+", key):
         key = key.lower()
     return key
@@ -357,8 +359,6 @@ class OpenAICompatibleClient:
 
     @staticmethod
     def _as_function_call_response(response):
-        # The CLI reads message.function_call, but the modern API returns
-        # message.tool_calls. Bridge the two so callers stay unchanged.
         choice = response.choices[0]
         message = choice.message
         if getattr(message, "function_call", None) is not None:
@@ -487,4 +487,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
