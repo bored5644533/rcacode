@@ -1,2 +1,2 @@
 Set-Location -LiteralPath $PSScriptRoot
-python Interface/CLI.py @args
+python interface/user_interface_cli.py @args
