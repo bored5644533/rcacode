@@ -1,4 +1,4 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-python CLI.py %*
+python interface/CLI.py %*
