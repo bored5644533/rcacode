@@ -1,0 +1,5 @@
+#!/bin/bash
+# RCA Code CLI launcher for Unix/Linux/macOS
+
+cd "$(dirname "$0")" || exit 1
+python -m interface.user_interface_cli "$@"
