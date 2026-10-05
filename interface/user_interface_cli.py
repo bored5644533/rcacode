@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
-from LLM_Handling import (
+from backend.llm_handling import (
     BANNER,
     add_model,
     create_llm_client,
