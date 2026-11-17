@@ -371,6 +371,9 @@ class OpenAICompatibleClient:
         legacy_message = SimpleNamespace(
             content=getattr(message, "content", ""),
             function_call=SimpleNamespace(name=call.name, arguments=call.arguments),
+            # Keep provider reasoning (e.g. DeepSeek's reasoning_content) so
+            # callers can log the model's thoughts for this step.
+            reasoning_content=getattr(message, "reasoning_content", None),
         )
         return SimpleNamespace(
             choices=[SimpleNamespace(message=legacy_message)],
