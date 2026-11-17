@@ -2,7 +2,21 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
+from urllib.parse import quote_plus
+
+# Allow running as a script (python interface/user_interface_cli.py) as well as
+# a module (python -m interface.user_interface_cli): when run as a script Python
+# only puts `interface/` on sys.path, so put the project root there too and the
+# `backend` package resolves either way.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BACKEND_DIR = os.path.join(PROJECT_ROOT, "backend")
+AGENTS_PATH = os.path.join(BACKEND_DIR, "agents.md")
+MEMORIES_PATH = os.path.join(BACKEND_DIR, "memories.md")
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -17,6 +31,7 @@ from backend.llm_handling import (
     read_model_config,
     switch_model,
 )
+from backend.chatlog import ChatLog, describe_model
 
 try:
     from playwright.sync_api import sync_playwright
@@ -24,6 +39,7 @@ except ImportError:
     sync_playwright = None
 
 SHOW_TOOL_DEBUG = os.environ.get("FTCCODE_SHOW_TOOL_DEBUG", "").lower() in {"1", "true", "yes"}
+
 
 from prompt_toolkit import Application
 from prompt_toolkit.cursor_shapes import CursorShape
@@ -269,8 +285,8 @@ def display_tool_progress(console, tool_name):
         console.print(f'[{color}]{msg}[/{color}]')
 
 
-def load_system_prompt(filepath="Agents.md"):
-    # Merge Agents.md (or provided filepath) with a local memories file when available.
+def load_system_prompt(filepath=AGENTS_PATH):
+    # Merge backend/agents.md (or provided filepath) with the memories file when available.
     parts = []
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -278,8 +294,13 @@ def load_system_prompt(filepath="Agents.md"):
     except FileNotFoundError:
         print(f"Warning: {filepath} not found.")
 
-    # Prefer lowercase 'memories.md' but accept 'Memories.md' too.
-    memories_candidates = ["memories.md", "Memories.md"]
+    # Memories now live in backend/memories.md; keep the old root-level
+    # filenames as fallbacks so memories saved before the move are not lost.
+    memories_candidates = [
+        MEMORIES_PATH,
+        os.path.join(PROJECT_ROOT, "memories.md"),
+        os.path.join(PROJECT_ROOT, "Memories.md"),
+    ]
     for mem in memories_candidates:
         try:
             if os.path.isfile(mem):
@@ -294,7 +315,7 @@ def load_system_prompt(filepath="Agents.md"):
         return "\n\n".join(parts)
 
     # Fallback default prompt
-    print(f"Warning: neither {filepath} nor memories.md found. Using default system prompt.")
+    print(f"Warning: neither {filepath} nor {MEMORIES_PATH} found. Using default system prompt.")
     return (
         "You are a helpful assistant for code development for First Tech "
         "Challenge (FTC) robotics teams. You are an expert in Java coding "
@@ -327,6 +348,16 @@ def get_tool_calls_from_response(response):
     return tool_calls
 
 
+def parse_tool_arguments(raw_arguments):
+    """Tool arguments arrive as a JSON string; keep them structured for logs."""
+    if not isinstance(raw_arguments, str):
+        return raw_arguments
+    try:
+        return json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return raw_arguments
+
+
 def execute_tool_call(tool_name, arguments):
     if isinstance(arguments, str):
         try:
@@ -348,8 +379,8 @@ def execute_tool_call(tool_name, arguments):
         if not memory:
             return "Missing memory for memory()"
         else:
-        # Store the memory in Memories.md 
-          with open("Memories.md", "a", encoding="utf-8") as f:
+        # Store the memory in backend/memories.md
+          with open(MEMORIES_PATH, "a", encoding="utf-8") as f:
                 f.write(f"{memory}\n")
         return f"Stored in memory: {memory}"
 
@@ -419,26 +450,110 @@ def execute_tool_call(tool_name, arguments):
             return "Web search is unavailable because Playwright is not installed."
         try:
             with sync_playwright() as p:
+                # `pip install` only provides the playwright package; the
+                # Chromium binary it drives is a separate download. Fetch it
+                # on first use so a fresh clone works with no manual setup
+                # step, and re-fetch after a playwright upgrade that expects
+                # a new browser revision.
+                if not os.path.exists(p.chromium.executable_path):
+                    print(
+                        "\nFirst search: downloading the Chromium browser "
+                        "web search needs (one-time, ~200 MB)...",
+                        flush=True,
+                    )
+                    try:
+                        # Inherit stdout/stderr so the download progress
+                        # bar is visible while it runs.
+                        install = subprocess.run(
+                            [sys.executable, "-m", "playwright", "install", "chromium"]
+                        )
+                    except Exception as install_error:
+                        install = None
+                        print(f"Browser download failed: {install_error}")
+                    if install is None or install.returncode != 0 or not os.path.exists(
+                        p.chromium.executable_path
+                    ):
+                        return (
+                            "Web search is unavailable: the Chromium browser "
+                            "could not be downloaded automatically.\n"
+                            "Run this once in the project folder and try "
+                            "again:\n"
+                            "  python -m playwright install chromium"
+                        )
                 browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(f"https://www.google.com/search?q={query}", wait_until="domcontentloaded", timeout=120000)
-                page.wait_for_timeout(3000)
-                snippets = []
-                for element in page.locator("div.g").all()[:4]:
-                    try:
-                        title = element.locator("h3").first.inner_text()
-                    except Exception:
-                        title = ""
-                    try:
-                        text = element.locator(".VwiC3b, .IsZvec").first.inner_text()
-                    except Exception:
-                        text = ""
-                    if title or text:
-                        snippets.append(f"{title}\n{text}".strip())
-                browser.close()
-                if snippets:
-                    return "\n\n".join(snippets[:4])
-                return page.locator("body").inner_text()[:4000]
+                try:
+                    # Headless Chromium's default "HeadlessChrome" user-agent
+                    # is a common bot-detection signal for search engines.
+                    page = browser.new_page(
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/131.0.0.0 Safari/537.36"
+                        )
+                    )
+                    q = quote_plus(query)
+
+                    def scrape(blocks_css, title_css, snippet_css):
+                        found = []
+                        for element in page.locator(blocks_css).all()[:8]:
+                            try:
+                                title = element.locator(title_css).first.inner_text()
+                            except Exception:
+                                title = ""
+                            try:
+                                text = element.locator(snippet_css).first.inner_text()
+                            except Exception:
+                                text = ""
+                            # Display URL (both engines use <cite>) so the
+                            # reader can judge a result by its domain.
+                            try:
+                                url = element.locator("cite").first.inner_text()
+                            except Exception:
+                                url = ""
+                            if title or text:
+                                found.append(
+                                    "\n".join(part for part in (title, text, url) if part)
+                                )
+                        return found
+
+                    # Bing first: it serves real result pages to headless
+                    # browsers (Google serves a bot-check page instead). The
+                    # result blocks exist immediately but their text is filled
+                    # in by the page's JS, so poll until they populate.
+                    page.goto(
+                        f"https://www.bing.com/search?q={q}",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    snippets = []
+                    for _ in range(8):
+                        snippets = scrape("li.b_algo", "h2", ".b_caption p")
+                        if len(snippets) >= 8:
+                            break
+                        page.wait_for_timeout(500)
+
+                    # Fallback: Google (the original engine), with a fast
+                    # bail-out when it serves its bot-check/consent page.
+                    if not snippets:
+                        page.goto(
+                            f"https://www.google.com/search?q={q}",
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                        if page.url.startswith("https://www.google.com/search"):
+                            page.wait_for_timeout(3000)
+                            snippets = scrape("div.g", "h3", ".VwiC3b, .IsZvec")
+
+                    if snippets:
+                        return "\n\n".join(snippets[:8])
+                    # No structured results: hand the model whatever the page
+                    # says. This has to run before browser.close().
+                    return (
+                        page.locator("body").inner_text()[:4000]
+                        or "Web search failed: no results were returned."
+                    )
+                finally:
+                    browser.close()
         except Exception as e:
             return f"Web search failed: {e}"
 
@@ -580,6 +695,8 @@ def main():
 
     system_prompt = load_system_prompt()
     conversation_history = [{"role": "system", "content": system_prompt}]
+    chatlog = ChatLog(model=describe_model(settings), messages=conversation_history)
+    console.print(f"[dim]Chat log: {chatlog.path}[/dim]\n")
 
     while True:
         try:
@@ -591,19 +708,24 @@ def main():
 
             clean_input = strip_mode_prefix(user_input)
 
+            if not clean_input:
+                continue
+
+            chatlog.record({"type": "user", "content": user_input})
+
             if clean_input.lower() in ["exit", "quit"]:
                 console.print("\n[bold blue]Goodbye![/bold blue]")
                 break
-
-            if not clean_input:
-                continue
 
             command_result = handle_cli_command(user_input, console)
             if command_result is not None:
                 if command_result != "handled":
                     settings = command_result
                     client = create_llm_client(settings)
+                    chatlog.set_model(describe_model(settings))
                     console.print(f"[dim]Now using {settings.id} ({settings.model}).[/dim]\n")
+                elif clean_input.lower() == "/thinking":
+                    chatlog.record({"type": "thinking", "content": thinking_summary()})
                 continue
 
             console.print("[bold cyan]You:[/bold cyan]", format_prompt_tags(user_input))
@@ -625,6 +747,9 @@ def main():
                 assistant_message = getattr(choice, "message", None)
                 function_call = getattr(assistant_message, "function_call", None)
                 assistant_reply = getattr(assistant_message, "content", None) or ""
+                # Reasoning, when the provider returns it (reasoning_content),
+                # is the model's "thoughts" for this step.
+                thoughts = getattr(assistant_message, "reasoning_content", None) or None
 
                 if not function_call:
                     narrative = extract_text_content(assistant_reply)
@@ -637,6 +762,19 @@ def main():
                     print_response_stats(console, response, elapsed, assistant_reply)
                     console.print("[dim]Thinking: hidden. Type /thinking for a short reasoning summary.[/dim]\n")
                     conversation_history.append({"role": "assistant", "content": assistant_reply})
+                    chatlog.record(
+                        {
+                            "type": "assistant",
+                            "thoughts": thoughts,
+                            "content": narrative or assistant_reply,
+                            "stats": {
+                                "tokens": completion_token_count(
+                                    response, assistant_reply
+                                ),
+                                "seconds": round(elapsed, 3),
+                            },
+                        }
+                    )
                     break
 
                 tool_name = function_call.name
@@ -655,12 +793,24 @@ def main():
                 conversation_history.append(
                     {"role": "function", "name": tool_name, "content": tool_result}
                 )
+                chatlog.record(
+                    {
+                        "type": "tool_call",
+                        "name": tool_name,
+                        "arguments": parse_tool_arguments(tool_arguments),
+                        "result": tool_result,
+                        "thoughts": thoughts or (assistant_reply.strip() or None),
+                    }
+                )
 
         except (KeyboardInterrupt, EOFError):
             console.print("\n[bold blue]Goodbye![/bold blue]")
             break
         except Exception as e:
             console.print(f"\n[bold red]API Error:[/bold red] {e}")
+            chatlog.record({"type": "error", "content": str(e)})
+
+    chatlog.close()
 
 
 if __name__ == "__main__":
